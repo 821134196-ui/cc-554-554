@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理台 · 停运事件与模拟接口</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <nav class="topnav">
+    <span class="brand">🚡 云岭索道</span>
+    <a class="navlink" href="/">游客服务</a>
+    <a class="navlink" href="/dispatch.html">调度台</a>
+    <a class="navlink active" href="/admin.html">管理台</a>
+  </nav>
+
+  <div id="app" class="container" v-cloak>
+    <div class="row">
+      <!-- 风速模拟 -->
+      <div class="card">
+        <h2>风速监测 <span class="sub">本地模拟接口</span></h2>
+        <div class="flex between">
+          <div>
+            <span style="font-size:32px; font-weight:700" :style="{ color: wind.exceeded ? '#c0392b' : '#14806a' }">
+              {{ wind.speed ?? '-' }}
+            </span> m/s
+            <div class="muted">安全阈值 {{ wind.threshold }} m/s · {{ wind.exceeded ? '已超阈值，建议停运' : '运行安全' }}</div>
+            <div class="muted">更新于 {{ wind.updated_at }}</div>
+          </div>
+        </div>
+        <div class="flex mt8">
+          <input type="number" v-model.number="windInput" step="0.1" min="0" style="width:110px">
+          <button class="btn primary sm" @click="setWind">设定风速</button>
+        </div>
+      </div>
+
+      <!-- 闸机模拟 -->
+      <div class="card">
+        <h2>闸机核销 <span class="sub">本地模拟接口（示例票号 T-ORD-1001-1）</span></h2>
+        <div class="flex">
+          <input type="text" v-model.trim="gateCode" placeholder="票号" style="width:200px">
+          <button class="btn primary sm" @click="verifyGate">核销过闸</button>
+        </div>
+        <p v-if="gateMsg" class="mt8" :style="{ color: gateOk ? '#1e8449' : '#c0392b' }">{{ gateMsg }}</p>
+        <p class="muted mt8">过闸后的票将标记为「已过闸」，不能按未使用票退款。</p>
+      </div>
+    </div>
+
+    <!-- 创建停运事件 -->
+    <div class="card">
+      <h2>创建停运事件 <span class="sub">再次停运请新建事件，历史处理记录自动保留</span></h2>
+      <div class="row">
+        <label class="field">事件标题
+          <input type="text" v-model.trim="form.title" placeholder="如：大风红色预警停运">
+        </label>
+        <label class="field">原因
+          <select v-model="form.reason">
+            <option value="weather">天气原因</option>
+            <option value="equipment">设备原因</option>
+          </select>
+        </label>
+        <label class="field">影响日期
+          <select v-model="form.date" @change="form.slotIds = []">
+            <option v-for="d in dates" :key="d" :value="d">{{ d }}</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">影响班次（勾选纳入停运范围）
+        <div class="flex wrap mt8">
+          <label v-for="s in slotsOfDate" :key="s.id" class="flex" style="gap:4px; font-size:14px">
+            <input type="checkbox" :value="s.id" v-model="form.slotIds">
+            {{ s.start_time }}-{{ s.end_time }}
+            <span class="muted">(已售{{ s.sold }})</span>
+          </label>
+        </div>
+      </label>
+      <label class="field">说明
+        <textarea v-model="form.description" rows="2" placeholder="停运说明，向游客展示"></textarea>
+      </label>
+      <button class="btn danger" @click="createEvent" :disabled="!form.title || form.slotIds.length === 0">
+        发布停运事件
+      </button>
+    </div>
+
+    <!-- 事件列表与恢复确认 -->
+    <div class="card">
+      <h2>停运事件列表 <span class="sub">恢复运营必须由设备负责人确认</span></h2>
+      <table class="grid" v-if="events.length">
+        <thead>
+          <tr><th>事件</th><th>原因</th><th>日期</th><th>状态</th><th>影响班次</th><th>处理记录</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="e in events" :key="e.id">
+            <td><b>#{{ e.id }}</b> {{ e.title }}</td>
+            <td>{{ REASON_LABEL[e.reason] }}</td>
+            <td>{{ e.event_date }}</td>
+            <td>
+              <span class="badge" :class="e.status === 'active' ? 'red' : 'green'">
+                {{ e.status === 'active' ? '停运中' : '已恢复' }}
+              </span>
+              <div v-if="e.resumed_by" class="muted">{{ e.resumed_by }} 确认恢复</div>
+            </td>
+            <td>{{ e.slot_count }}</td>
+            <td>{{ e.action_count }} 条</td>
+            <td>
+              <template v-if="e.status === 'active'">
+                <button v-if="resumeFor !== e.id" class="btn success sm" @click="openResume(e.id)">恢复运营</button>
+                <div v-else class="flex wrap" style="gap:6px">
+                  <select v-model="resumeManager">
+                    <option v-for="m in managers" :key="m.id" :value="m.name">{{ m.name }}</option>
+                  </select>
+                  <label class="flex" style="gap:4px; font-size:13px">
+                    <input type="checkbox" v-model="resumeConfirm"> 设备已检修完毕
+                  </label>
+                  <button class="btn success sm" :disabled="!resumeConfirm" @click="resume(e.id)">确认恢复</button>
+                  <button class="btn ghost sm" @click="resumeFor = null">取消</button>
+                </div>
+              </template>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无事件。</p>
+    </div>
+
+    <!-- 支付网关模拟 -->
+    <div class="card">
+      <h2>支付网关（模拟）<span class="sub">退款回执可重复、可晚到，系统保证结果一致</span></h2>
+      <h3 style="font-size:14px; margin-bottom:8px">待回执退款单</h3>
+      <table class="grid" v-if="pending.length">
+        <thead><tr><th>退款单号</th><th>票号</th><th>乘客</th><th>金额</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="p in pending" :key="p.refund_txn">
+            <td class="muted">{{ p.refund_txn }}</td>
+            <td class="muted">{{ p.ticket_code }}</td>
+            <td>{{ p.passenger_name }}</td>
+            <td>¥{{ p.amount }}</td>
+            <td class="flex">
+              <button class="btn success sm" @click="callback(p.refund_txn, 'success')">成功回执</button>
+              <button class="btn danger sm" @click="callback(p.refund_txn, 'failure')">失败回执</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无待回执的退款单。</p>
+
+      <h3 style="font-size:14px; margin:16px 0 8px">回执流水（含被忽略的晚到/重复回执）</h3>
+      <table class="grid" v-if="callbacks.length">
+        <thead><tr><th>时间</th><th>回执号</th><th>退款单号</th><th>结果</th><th>是否生效</th><th>说明</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="c in callbacks" :key="c.callback_id">
+            <td class="muted">{{ c.received_at }}</td>
+            <td class="muted">{{ c.callback_id.slice(0, 14) }}…</td>
+            <td class="muted">{{ c.txn }}</td>
+            <td><span class="badge" :class="c.result === 'success' ? 'green' : 'red'">{{ c.result === 'success' ? '成功' : '失败' }}</span></td>
+            <td><span class="badge" :class="c.applied ? 'green' : 'gray'">{{ c.applied ? '已生效' : '未生效' }}</span></td>
+            <td class="muted">{{ c.note }}</td>
+            <td>
+              <button class="btn ghost sm" @click="callback(c.txn, c.result === 'success' ? 'failure' : 'success')">
+                补发相反回执
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">暂无回执。</p>
+    </div>
+  </div>
+
+  <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/js/common.js"></script>
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          wind: {},
+          windInput: 6.2,
+          gateCode: "",
+          gateMsg: "",
+          gateOk: true,
+          slots: [],
+          events: [],
+          managers: [],
+          form: { title: "", reason: "weather", date: "", slotIds: [], description: "" },
+          resumeFor: null,
+          resumeManager: "",
+          resumeConfirm: false,
+          pending: [],
+          callbacks: [],
+          timer: null,
+          REASON_LABEL,
+        };
+      },
+      computed: {
+        dates() { return [...new Set(this.slots.map((s) => s.date))]; },
+        slotsOfDate() { return this.slots.filter((s) => s.date === this.form.date); },
+      },
+      methods: {
+        async loadWind() { this.wind = await api("/api/mock/wind"); },
+        async setWind() {
+          this.wind = await post("/api/mock/wind", { speed: this.windInput });
+          toast(this.wind.exceeded ? "风速已超阈值！" : "风速已更新");
+        },
+        async verifyGate() {
+          try {
+            const r = await post("/api/mock/gate/verify", { ticket_code: this.gateCode });
+            this.gateOk = true;
+            this.gateMsg = `票 ${r.ticket_code} 核销成功，${r.gate_verified_at} 过闸`;
+          } catch (e) {
+            this.gateOk = false;
+            this.gateMsg = e.message;
+          }
+        },
+        async loadSlots() {
+          const r = await api("/api/slots");
+          this.slots = r.slots;
+          if (!this.form.date && this.dates.length) this.form.date = this.dates[0];
+        },
+        async loadEvents() { this.events = (await api("/api/events")).events; },
+        async loadPayment() {
+          this.pending = (await api("/api/mock/payment/pending")).pending;
+          this.callbacks = (await api("/api/mock/payment/callbacks")).callbacks;
+        },
+        async createEvent() {
+          try {
+            await post("/api/events", {
+              title: this.form.title, reason: this.form.reason,
+              event_date: this.form.date, slot_ids: this.form.slotIds,
+              description: this.form.description,
+            });
+            toast("停运事件已发布");
+            this.form.title = ""; this.form.slotIds = []; this.form.description = "";
+            await Promise.all([this.loadEvents(), this.loadSlots()]);
+          } catch (e) { toast(e.message, false); }
+        },
+        openResume(id) {
+          this.resumeFor = id;
+          this.resumeConfirm = false;
+          this.resumeManager = this.managers.length ? this.managers[0].name : "";
+        },
+        async resume(id) {
+          try {
+            await post(`/api/events/${id}/resume`, {
+              manager_name: this.resumeManager, confirm: this.resumeConfirm,
+            });
+            toast("已恢复运营");
+            this.resumeFor = null;
+            await Promise.all([this.loadEvents(), this.loadSlots()]);
+          } catch (e) { toast(e.message, false); }
+        },
+        async callback(txn, result) {
+          try {
+            const r = await post("/api/mock/payment/callback", {
+              callback_id: "cb-" + Date.now() + "-" + Math.random().toString(16).slice(2, 8),
+              txn, result,
+            });
+            toast(r.applied ? "回执已生效" : `回执未生效：${r.note}`, r.applied);
+            await this.loadPayment();
+          } catch (e) { toast(e.message, false); }
+        },
+      },
+      async mounted() {
+        this.managers = (await api("/api/events/staff?role=equipment_manager")).staff;
+        await Promise.all([this.loadWind(), this.loadSlots(), this.loadEvents(), this.loadPayment()]);
+        this.timer = setInterval(() => {
+          this.loadWind(); this.loadEvents(); this.loadPayment();
+        }, 4000);
+      },
+      unmounted() { clearInterval(this.timer); },
+    }).mount("#app");
+  </script>
+</body>
+</html>

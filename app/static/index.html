@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>游客服务 · 缆车停运退票改签</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <nav class="topnav">
+    <span class="brand">🚡 云岭索道</span>
+    <a class="navlink active" href="/">游客服务</a>
+    <a class="navlink" href="/dispatch.html">调度台</a>
+    <a class="navlink" href="/admin.html">管理台</a>
+  </nav>
+
+  <div id="app" class="container" v-cloak>
+    <div class="card">
+      <h2>订单查询 <span class="sub">输入订单号查看车票与停运处理选项（示例：ORD-1001 ~ ORD-1004）</span></h2>
+      <div class="flex">
+        <input type="text" v-model.trim="orderNo" placeholder="订单号，如 ORD-1001"
+               style="width:260px" @keyup.enter="loadOrder">
+        <button class="btn primary" @click="loadOrder" :disabled="loading">查询</button>
+      </div>
+    </div>
+
+    <div v-if="error" class="banner danger">⚠ {{ error }}</div>
+
+    <template v-if="order">
+      <div v-if="affectedEvent" class="banner danger">
+        ⚠ <b>停运通知：</b>「{{ affectedEvent.title }}」您订单中有受影响的班次，请在下方为每位同行人分别选择
+        <b>退款</b>、<b>换时段</b> 或 <b>加入候补</b>。
+      </div>
+
+      <div class="card">
+        <h2>订单 {{ order.order_no }} <span class="sub">{{ order.visitor_name }} · {{ order.phone }}</span></h2>
+
+        <div v-for="t in order.tickets" :key="t.id" class="ticket-card"
+             :class="{ suspended: t.event && !t.action }">
+          <div class="flex between wrap">
+            <div>
+              <b>{{ t.passenger_name }}</b>
+              <span class="muted"> · 票号 {{ t.ticket_code }} · ¥{{ t.price }}</span>
+              <div class="mt8">
+                班次：<b>{{ fmtSlot(t.slot) }}</b>
+                <span class="badge" :class="SLOT_STATUS[t.slot.status][1]">{{ SLOT_STATUS[t.slot.status][0] }}</span>
+                <span class="badge" :class="TICKET_STATUS[t.status][1]">{{ TICKET_STATUS[t.status][0] }}</span>
+              </div>
+              <div v-if="t.gate_verified_at" class="muted mt8">过闸时间：{{ t.gate_verified_at }}</div>
+            </div>
+
+            <!-- 未处理且受影响：展示三种处理方式 -->
+            <div v-if="t.event && !t.action && t.status === 'active'" class="flex">
+              <button class="btn danger sm" @click="openPanel(t, 'refund')">退款</button>
+              <button class="btn primary sm" @click="openPanel(t, 'rebook')">换时段</button>
+              <button class="btn warn sm" @click="openPanel(t, 'waitlist')">加入候补</button>
+            </div>
+            <div v-else-if="t.status === 'used'" class="muted">已过闸，不可按未使用票退改</div>
+          </div>
+
+          <!-- 已有处理结果 -->
+          <div v-if="t.action" class="mt8">
+            <span class="badge" :class="ACTION_STATUS[t.action.status][1]">
+              {{ ACTION_TYPE[t.action.action_type] }} · {{ ACTION_STATUS[t.action.status][0] }}
+            </span>
+            <span class="muted"> {{ t.action.note }}</span>
+            <div v-if="t.waitlist && t.waitlist.status === 'waiting'" class="muted mt8">
+              候补排队中：第 <b>{{ t.waitlist.position }}</b> 位，期望 {{ fmtSlot(t.waitlist.desired_slot) }}
+            </div>
+          </div>
+
+          <!-- 操作面板 -->
+          <div v-if="panel.ticketId === t.id" class="mt8" style="border-top:1px dashed #e4e9f0; padding-top:12px">
+            <template v-if="panel.type === 'refund'">
+              <p class="mb8">将为 <b>{{ t.passenger_name }}</b> 办理退款 ¥{{ t.price }}，退款到账以支付回执为准。确认？</p>
+              <button class="btn danger sm" @click="submit(t)" :disabled="submitting">确认退款</button>
+              <button class="btn ghost sm" @click="panel.ticketId = null">取消</button>
+            </template>
+
+            <template v-else>
+              <p class="mb8">{{ panel.type === 'rebook' ? '选择新时段（仅显示正常且有余票的班次）：' : '选择期望时段（候补按排队顺序在实际空余运力内递补）：' }}</p>
+              <div class="flex wrap mb8">
+                <div v-for="s in candidateSlots(t)" :key="s.id" class="slot-option"
+                     :class="{ selected: panel.slotId === s.id }" @click="panel.slotId = s.id">
+                  {{ fmtSlot(s) }}
+                  <span class="badge" :class="s.remaining > 0 ? 'green' : 'orange'">
+                    {{ s.remaining > 0 ? '余 ' + s.remaining : '已满' }}
+                  </span>
+                </div>
+                <div v-if="candidateSlots(t).length === 0" class="muted">暂无可选时段</div>
+              </div>
+              <button class="btn primary sm" @click="submit(t)" :disabled="submitting || !panel.slotId">
+                {{ panel.type === 'rebook' ? '确认改签' : '确认加入候补' }}
+              </button>
+              <button class="btn ghost sm" @click="panel.ticketId = null">取消</button>
+            </template>
+          </div>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/js/common.js"></script>
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          orderNo: "ORD-1001",
+          order: null,
+          slots: [],
+          loading: false,
+          submitting: false,
+          error: "",
+          panel: { ticketId: null, type: null, slotId: null, key: null },
+          TICKET_STATUS, SLOT_STATUS, ACTION_TYPE, ACTION_STATUS,
+        };
+      },
+      computed: {
+        affectedEvent() {
+          if (!this.order) return null;
+          const t = this.order.tickets.find((x) => x.event);
+          return t ? t.event : null;
+        },
+      },
+      methods: {
+        fmtSlot,
+        async loadOrder() {
+          this.loading = true; this.error = ""; this.order = null;
+          try {
+            const [order, slots] = await Promise.all([
+              api(`/api/orders/${encodeURIComponent(this.orderNo)}`),
+              api("/api/slots"),
+            ]);
+            this.order = order;
+            this.slots = slots.slots;
+            this.panel = { ticketId: null, type: null, slotId: null, key: null };
+          } catch (e) {
+            this.error = e.message;
+          } finally {
+            this.loading = false;
+          }
+        },
+        openPanel(t, type) {
+          // 每次打开面板生成新的幂等键：同一次用户意图的重试共享该键
+          this.panel = { ticketId: t.id, type, slotId: null, key: newKey() };
+        },
+        candidateSlots(t) {
+          return this.slots.filter((s) => {
+            if (s.id === t.slot.id) return false;
+            if (this.panel.type === "rebook") return s.status === "normal" && s.remaining > 0;
+            return true; // 候补可选满员时段
+          });
+        },
+        async submit(t) {
+          this.submitting = true;
+          try {
+            const body = {
+              action_type: this.panel.type,
+              idempotency_key: this.panel.key,
+              target_slot_id: this.panel.slotId || null,
+            };
+            const r = await post(`/api/tickets/${t.id}/action`, body);
+            toast(r.created ? "提交成功" : "该请求已提交过，返回原处理结果");
+            await this.loadOrder();
+          } catch (e) {
+            toast(e.message, false);
+          } finally {
+            this.submitting = false;
+          }
+        },
+      },
+    }).mount("#app");
+  </script>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>调度台 · 缆车停运候补调度</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <nav class="topnav">
+    <span class="brand">🚡 云岭索道</span>
+    <a class="navlink" href="/">游客服务</a>
+    <a class="navlink active" href="/dispatch.html">调度台</a>
+    <a class="navlink" href="/admin.html">管理台</a>
+  </nav>
+
+  <div id="app" class="container" v-cloak>
+    <div class="card">
+      <div class="flex between wrap">
+        <div class="flex">
+          <span>停运事件：</span>
+          <select v-model="eventId" @change="loadBoard">
+            <option v-for="e in events" :key="e.id" :value="e.id">
+              #{{ e.id }} {{ e.title }}（{{ e.status === 'active' ? '停运中' : '已恢复' }}）
+            </option>
+          </select>
+          <span v-if="board" class="badge" :class="board.event.status === 'active' ? 'red' : 'green'">
+            {{ board.event.status === 'active' ? '停运中' : '已恢复运营' }}
+          </span>
+        </div>
+        <div class="flex">
+          <span class="muted">调度员</span>
+          <input type="text" v-model.trim="operator" style="width:100px">
+          <button class="btn ghost sm" @click="loadBoard">刷新</button>
+        </div>
+      </div>
+      <div v-if="board" class="muted mt8">
+        {{ REASON_LABEL[board.event.reason] }} · 影响日期 {{ board.event.event_date }}
+        <template v-if="board.event.resumed_by"> · 由设备负责人 {{ board.event.resumed_by }} 确认恢复于 {{ board.event.resolved_at }}</template>
+      </div>
+    </div>
+
+    <div v-if="board && board.event.status === 'active'" class="banner danger">
+      ⚠ 事件仍在停运中：目标时段须为正常班次才能递补；恢复运营请到管理台由设备负责人确认。
+    </div>
+
+    <template v-if="board">
+      <!-- 各时段运力并列展示 -->
+      <div class="card">
+        <h2>班次运力 <span class="sub">已售 / 剩余并列展示，候补只能在实际空余运力内递补</span></h2>
+        <table class="grid">
+          <thead>
+            <tr><th>时段</th><th>状态</th><th>已售</th><th>剩余</th><th>容量</th><th>占用</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in board.slots" :key="s.id">
+              <td><b>{{ s.start_time }}-{{ s.end_time }}</b>
+                <span v-if="s.affected" class="badge red">停运范围</span>
+              </td>
+              <td><span class="badge" :class="SLOT_STATUS[s.status][1]">{{ SLOT_STATUS[s.status][0] }}</span></td>
+              <td>{{ s.sold }}</td>
+              <td><b :style="{ color: s.remaining > 0 ? '#14806a' : '#c0392b' }">{{ s.remaining }}</b></td>
+              <td>{{ s.capacity }}</td>
+              <td>
+                <div class="capacity-bar" :class="{ full: s.remaining === 0 }">
+                  <div :style="{ width: (s.capacity ? (s.sold / s.capacity * 100) : 0) + '%' }"></div>
+                </div>
+              </td>
+              <td>
+                <button class="btn primary sm"
+                        :disabled="s.status !== 'normal' || s.remaining === 0 || waitingForSlot(s.id) === 0"
+                        @click="autoPromote(s)">
+                  自动递补（{{ waitingForSlot(s.id) }}）
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 候补队列 -->
+      <div class="card">
+        <h2>候补队列 <span class="sub">按提交顺序排队，递补结果实时同步</span></h2>
+        <table class="grid" v-if="board.waitlist.length">
+          <thead>
+            <tr><th>顺位</th><th>乘客</th><th>票号</th><th>期望时段</th><th>状态</th><th>递补到</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="w in board.waitlist" :key="w.id">
+              <td>#{{ w.position }}</td>
+              <td>{{ w.passenger_name }}</td>
+              <td class="muted">{{ w.ticket_code }}</td>
+              <td>{{ fmtSlot(w.desired_slot) }}</td>
+              <td>
+                <span v-if="w.status === 'waiting'" class="badge blue">排队中</span>
+                <span v-else-if="w.status === 'promoted'" class="badge green">已递补 · {{ w.promoted_by }}</span>
+                <span v-else class="badge gray">{{ w.status }}</span>
+              </td>
+              <td>
+                <select v-if="w.status === 'waiting'" v-model.number="promoteTarget[w.id]" style="min-width:170px">
+                  <option v-for="s in promotableSlots" :key="s.id" :value="s.id">
+                    {{ s.start_time }}-{{ s.end_time }}（余 {{ s.remaining }}）
+                  </option>
+                </select>
+              </td>
+              <td>
+                <button v-if="w.status === 'waiting'" class="btn success sm"
+                        :disabled="!promoteTarget[w.id] || busy"
+                        @click="promote(w)">递补</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">当前没有候补记录。</p>
+      </div>
+
+      <!-- 处理记录 -->
+      <div class="card">
+        <h2>处理记录 <span class="sub">本事件内所有退款/改签/候补结果，永久保留</span></h2>
+        <table class="grid" v-if="board.actions.length">
+          <thead>
+            <tr><th>时间</th><th>票号</th><th>乘客</th><th>方式</th><th>状态</th><th>操作人</th><th>备注</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="a in board.actions" :key="a.id">
+              <td class="muted">{{ a.created_at }}</td>
+              <td class="muted">{{ a.ticket_code }}</td>
+              <td>{{ a.passenger_name }}</td>
+              <td>{{ ACTION_TYPE[a.action_type] }}</td>
+              <td><span class="badge" :class="ACTION_STATUS[a.status][1]">{{ ACTION_STATUS[a.status][0] }}</span></td>
+              <td>{{ a.operator }}</td>
+              <td class="muted">{{ a.note }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">暂无处理记录。</p>
+      </div>
+    </template>
+    <div v-else class="card muted">暂无停运事件，请先在管理台创建。</div>
+  </div>
+
+  <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/js/common.js"></script>
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          events: [],
+          eventId: null,
+          board: null,
+          operator: "王芳",
+          promoteTarget: {},
+          busy: false,
+          timer: null,
+          SLOT_STATUS, ACTION_TYPE, ACTION_STATUS, REASON_LABEL,
+        };
+      },
+      computed: {
+        promotableSlots() {
+          if (!this.board) return [];
+          return this.board.slots.filter((s) => s.status === "normal" && s.remaining > 0);
+        },
+      },
+      methods: {
+        fmtSlot,
+        waitingForSlot(slotId) {
+          return this.board.waitlist.filter(
+            (w) => w.status === "waiting" && w.desired_slot.id === slotId
+          ).length;
+        },
+        async loadEvents() {
+          const r = await api("/api/events");
+          this.events = r.events;
+          if (!this.eventId && this.events.length) {
+            const active = this.events.find((e) => e.status === "active");
+            this.eventId = (active || this.events[0]).id;
+          }
+        },
+        async loadBoard() {
+          if (!this.eventId) { this.board = null; return; }
+          try {
+            this.board = await api(`/api/dispatch/board?event_id=${this.eventId}`);
+            // 为排队中的候补默认选中其期望时段（若可递补）
+            for (const w of this.board.waitlist) {
+              if (w.status === "waiting" && !this.promoteTarget[w.id]) {
+                const ok = this.promotableSlots.some((s) => s.id === w.desired_slot.id);
+                this.promoteTarget[w.id] = ok ? w.desired_slot.id
+                  : (this.promotableSlots[0] && this.promotableSlots[0].id) || null;
+              }
+            }
+          } catch (e) { /* 事件可能不存在 */ }
+        },
+        async promote(w) {
+          this.busy = true;
+          try {
+            await post("/api/dispatch/promote", {
+              entry_id: w.id, slot_id: this.promoteTarget[w.id], operator: this.operator,
+            });
+            toast(`已将 ${w.passenger_name} 递补成功`);
+          } catch (e) {
+            toast(e.message, false);
+          } finally {
+            this.busy = false;
+            await this.loadBoard();
+          }
+        },
+        async autoPromote(s) {
+          this.busy = true;
+          try {
+            const r = await post("/api/dispatch/auto_promote", {
+              event_id: this.eventId, slot_id: s.id, operator: this.operator,
+            });
+            toast(r.count ? `自动递补 ${r.count} 人至 ${s.start_time} 班次` : "没有可递补的候补或名额不足");
+          } catch (e) {
+            toast(e.message, false);
+          } finally {
+            this.busy = false;
+            await this.loadBoard();
+          }
+        },
+      },
+      async mounted() {
+        await this.loadEvents();
+        await this.loadBoard();
+        this.timer = setInterval(async () => {
+          await this.loadEvents();
+          await this.loadBoard();
+        }, 3000);
+      },
+      unmounted() { clearInterval(this.timer); },
+    }).mount("#app");
+  </script>
+</body>
+</html>
