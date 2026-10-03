@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>景区缆车停运退票与候补改签系统</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <h1>🚡 缆车停运退票与候补改签系统</h1>
+    <span class="wind-chip" :class="{ unsafe: wind && !wind.safe }" title="本地模拟风速站">
+      🌬️ 当前风速 {{ wind ? wind.speed.toFixed(1) : '—' }} m/s
+      <span class="small">（阈值 {{ wind ? wind.limit : 15 }}，{{ wind && wind.safe ? '适航' : '超限' }}）</span>
+    </span>
+    <nav class="tabs">
+      <button :class="{active: tab==='tourist'}" @click="switchTab('tourist')">游客端</button>
+      <button :class="{active: tab==='dispatch'}" @click="switchTab('dispatch')">调度端</button>
+      <button :class="{active: tab==='ops'}" @click="switchTab('ops')">运营/设备</button>
+      <button :class="{active: tab==='mock'}" @click="switchTab('mock')">本地模拟接口</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ============================ 游客端 ============================ -->
+    <section v-if="tab==='tourist'">
+      <div class="card">
+        <h2>查询我的订单</h2>
+        <div class="row">
+          <input v-model="orderNo" placeholder="输入订单号，如 2026100301" style="width:260px"
+                 @keyup.enter="searchOrder" />
+          <button class="btn primary" @click="searchOrder">查询</button>
+          <span class="muted small">演示订单：2026100301（08:00 停运班）、2026100302（含已过闸票）</span>
+        </div>
+      </div>
+
+      <template v-if="order">
+        <div class="banner danger" v-if="order.active_event">
+          <div>
+            <div class="b-title">⛔ 停运通知：{{ order.active_event.reason_cn }}</div>
+            <div class="small">{{ order.active_event.detail }}</div>
+            <div class="small">
+              停运范围：
+              <template v-for="(sid,i) in order.active_event.affected_slot_ids" :key="sid">
+                <span class="badge suspended">{{ slotCode(sid) }}</span>
+                <span v-if="i < order.active_event.affected_slot_ids.length-1">、</span>
+              </template>
+              ｜事件 #{{ order.active_event.id }}（{{ order.active_event.status === 'active' ? '停运处理中' : '已恢复' }}）
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>订单 {{ order.order_no }}
+            <span class="muted small">{{ order.contact_name }} · {{ order.contact_phone }}</span>
+          </h2>
+          <p class="muted small" style="margin-top:-6px">
+            可按同行人分别选择处理方式；已过闸或已处理的票锁定。退款与改签互斥，每张票只能有一个最终结果。
+          </p>
+
+          <div v-for="t in order.tickets" :key="t.id" class="ticket-card" :class="{ locked: !t.can_handle }">
+            <div class="ticket-head">
+              <span class="ticket-name">{{ t.passenger_name }}</span>
+              <span class="ticket-no">{{ t.ticket_no }}</span>
+              <span class="badge" :class="t.checked_in ? 'checked_in' : t.status">
+                {{ t.checked_in ? '已过闸核销' : t.status_cn }}
+              </span>
+              <span class="spacer"></span>
+              <span class="num">原班次 <b>{{ t.slot_code }}</b>（{{ t.slot_time }}）</span>
+            </div>
+
+            <!-- 可处理票 -->
+            <div v-if="t.can_handle" class="ticket-actions">
+              <button class="btn danger" @click="doRefund(t)">申请退款</button>
+              <span style="color:var(--line)">|</span>
+              <label class="inline small">换时段</label>
+              <select v-model="form[t.id].rebookSlot">
+                <option value="">选择可选班次…</option>
+                <option v-for="o in t.options" :key="o.slot_id" :value="o.slot_id">
+                  {{ o.code }} {{ o.start_time }}（余 {{ o.remaining }}）
+                </option>
+              </select>
+              <button class="btn primary" :disabled="!form[t.id].rebookSlot"
+                      @click="doRebook(t)">立即改签</button>
+              <label class="inline small">候补</label>
+              <select v-model="form[t.id].waitSlot">
+                <option value="">候补可选班次…</option>
+                <option v-for="o in t.options" :key="o.slot_id" :value="o.slot_id">
+                  {{ o.code }} {{ o.start_time }}（余 {{ o.remaining }}，满员也可排队）
+                </option>
+              </select>
+              <button class="btn warn" :disabled="!form[t.id].waitSlot"
+                      @click="doWaitlist(t)">加入候补</button>
+            </div>
+
+            <!-- 候补中 -->
+            <div v-else-if="t.status==='waitlisted' && t.waitlist" class="ticket-actions">
+              <span class="badge waitlisted">候补 {{ slotCode(t.waitlist.target_slot_id) }} ·
+                队列第 {{ t.waitlist.position }} 位</span>
+              <button class="btn" @click="doCancelWaitlist(t)">撤回候补</button>
+              <span class="muted small">恢复运营并确认运力后，由调度员按队列顺序递补，本页稍后刷新可见结果。</span>
+            </div>
+
+            <!-- 已改签 -->
+            <template v-else-if="t.status==='reassigned'">
+              <div class="newticket">✅ 已改签，旧票 {{ t.ticket_no }} 已失效；新票与后续过闸记录见订单内新生成的票号。</div>
+            </template>
+
+            <!-- 已过闸 -->
+            <div v-else-if="t.checked_in" class="payline">
+              ⚠️ 该票已过闸核销（{{ fmt(t.checked_in_at) }}），不属于停运未使用票，不能直接退款或改签。
+            </div>
+
+            <!-- 已退款 -->
+            <div v-else-if="t.status==='refunded'" class="payline">💸 退款已受理，等待/查看支付回执。</div>
+
+            <!-- 改签产生的新票 -->
+            <div v-else-if="t.source_ticket_id" class="payline">
+              🎫 这是改签后生成的新票（班次 {{ t.slot_code }}），未使用，可凭此票号过闸。
+            </div>
+
+            <!-- 其他无需处理 -->
+            <div v-else class="payline muted">该票当前无需停运处理。</div>
+
+            <!-- 支付回执 -->
+            <div v-if="t.payment" class="payline">
+              支付单 {{ t.payment.payment_no }} · ¥{{ t.payment.amount }}
+              <span class="badge" :class="t.payment.gateway_status">
+                {{ {pending:'回执处理中', succeeded:'退款成功', failed:'退款失败'}[t.payment.gateway_status] }}
+              </span>
+              <button v-if="t.payment.gateway_status==='failed'" class="btn small"
+                      @click="retryPay(t.payment.payment_no)">重新发起退款</button>
+              <span class="small">票的结果以受理为准，晚到回执不会改变退款/改签结论。</span>
+            </div>
+
+            <details>
+              <summary>处理流水</summary>
+              <ul class="timeline">
+                <li v-for="a in timelines[t.id] || []" :key="a.id">
+                  {{ fmt(a.created_at) }} · {{ actionCn(a.action) }} · {{ a.operator }}
+                  <span v-if="a.detail.to_slot">→ {{ slotCode(a.detail.to_slot) }}</span>
+                  <span v-if="a.detail.new_ticket_no">新票 {{ a.detail.new_ticket_no }}</span>
+                </li>
+              </ul>
+            </details>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ============================ 调度端 ============================ -->
+    <section v-if="tab==='dispatch'">
+      <div class="banner warn" v-if="dash && dash.active_event">
+        <div>
+          <div class="b-title">停运事件 #{{ dash.active_event.id }} 尚未恢复（{{ dash.active_event.reason_cn }}）</div>
+          <div class="small">候补递补功能已锁定，须待运营/设备端由<b>设备负责人</b>确认恢复且风速达标后开放。</div>
+        </div>
+      </div>
+      <div class="banner ok" v-else>
+        <div><div class="b-title">运营正常</div>
+          <div class="small">可调整恢复后运力并按 FIFO 递补候补；递补只在实际空余运力内发生。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>各时段运力看板
+          <span class="spacer"></span>
+          <button class="btn" @click="loadDash">刷新</button>
+          <button class="btn primary" :disabled="!!(dash && dash.active_event)" @click="autoFill">
+            一键 FIFO 递补全部候补
+          </button>
+          <label class="inline small"><input type="checkbox" v-model="autoRefresh" /> 自动刷新(4s)</label>
+        </h2>
+        <table>
+          <thead><tr>
+            <th>班次</th><th>时间</th><th>状态</th><th>运力(可调整)</th>
+            <th>已售/已占</th><th>剩余名额</th><th>候补人数</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+          <tr v-for="s in (dash ? dash.slots : [])" :key="s.id">
+            <td class="num"><b>{{ s.code }}</b></td>
+            <td>{{ s.start_time }}–{{ s.end_time }}</td>
+            <td><span class="badge" :class="s.suspended ? 'suspended' : 'running'">{{ s.status }}</span></td>
+            <td>
+              <input type="number" min="0" class="num" style="width:80px"
+                     :value="s.capacity" @change="setCapacity(s, $event)" />
+            </td>
+            <td class="num">{{ s.occupied }}</td>
+            <td class="num" :class="s.remaining===0?'remain-zero':(s.remaining<=2?'remain-low':'')">
+              {{ s.remaining }}
+            </td>
+            <td class="num">{{ (dash.waitlist_by_slot[s.id] || []).length }}</td>
+            <td>
+              <button class="btn primary" :disabled="!!(dash && dash.active_event) || s.suspended
+                       || (dash.waitlist_by_slot[s.id] || []).length===0"
+                      @click="fillOne(s.id)">递补下一位</button>
+            </td>
+          </tr>
+          </tbody>
+        </table>
+        <p class="muted small">剩余名额 = 运力 − 名额占用表计数；并发下递补事务在数据库层串行，绝不会把同一名额给两个人。</p>
+      </div>
+
+      <div class="card">
+        <h2>候补队列（按目标班次、入列时间 FIFO）</h2>
+        <template v-if="dash && dash.waitlist_total === 0">
+          <p class="muted">当前没有排队中的候补。</p>
+        </template>
+        <template v-for="(items, sid) in (dash ? dash.waitlist_by_slot : {})" :key="sid">
+          <h3>目标班次 {{ slotCode(sid) }}</h3>
+          <table>
+            <thead><tr><th style="width:60px">顺位</th><th>票号</th><th>同行人</th><th>入列时间</th></tr></thead>
+            <tbody>
+              <tr v-for="w in items" :key="w.entry_id">
+                <td class="num">#{{ w.position }}</td>
+                <td>{{ w.ticket_no }}</td><td>{{ w.passenger_name }}</td>
+                <td>{{ fmt(w.created_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </template>
+      </div>
+    </section>
+
+    <!-- ============================ 运营/设备端 ============================ -->
+    <section v-if="tab==='ops'">
+      <div class="card">
+        <h2>发起停运事件</h2>
+        <p class="muted small" style="margin-top:-6px">再次停运将新建独立事件，此前事件与所有处理记录永久保留。</p>
+        <div class="row" style="margin-bottom:10px">
+          <div class="pill-group">
+            <span class="check-pill" :class="{on: eventForm.reason==='weather'}"
+                  @click="eventForm.reason='weather'">天气原因（大风）</span>
+            <span class="check-pill" :class="{on: eventForm.reason==='equipment'}"
+                  @click="eventForm.reason='equipment'">设备原因</span>
+          </div>
+        </div>
+        <div class="check-list" style="margin-bottom:10px">
+          <span v-for="s in slots" :key="s.id" class="check-pill"
+                :class="{on: eventForm.selected.includes(s.id)}"
+                @click="toggleSlot(s.id)">
+            {{ s.code }} {{ s.start_time }}
+          </span>
+        </div>
+        <div class="row">
+          <input v-model="eventForm.detail" placeholder="说明（可选）" style="flex:1;min-width:220px" />
+          <input v-model="eventForm.created_by" placeholder="发起人" style="width:140px" />
+          <button class="btn danger" @click="createEvent">发起停运</button>
+        </div>
+      </div>
+
+      <div class="card" v-for="ev in events" :key="ev.id">
+        <h2>事件 #{{ ev.id }} · {{ ev.reason_cn }}
+          <span class="badge" :class="ev.status==='active' ? 'suspended' : 'running'">
+            {{ ev.status==='active' ? '停运中' : '已恢复' }}
+          </span>
+        </h2>
+        <div class="kv">
+          <span class="k">停运范围</span>
+          <span>
+            <span v-for="sid in ev.affected_slot_ids" :key="sid" class="badge suspended" style="margin-right:6px">
+              {{ slotCode(sid) }}
+            </span>
+          </span>
+          <span class="k">发起风速</span><span>{{ ev.wind_speed }} m/s</span>
+          <span class="k">发起时间</span><span>{{ fmt(ev.created_at) }}</span>
+          <span class="k">说明</span><span>{{ ev.detail }}</span>
+          <template v-if="ev.status==='resumed'">
+            <span class="k">恢复确认人</span><span>{{ ev.resumed_by }}（设备负责人）</span>
+            <span class="k">恢复时间</span><span>{{ fmt(ev.resumed_at) }}</span>
+          </template>
+        </div>
+        <div v-if="ev.status==='active'" style="margin-top:14px;border-top:1px dashed var(--line);padding-top:14px">
+          <div class="banner warn small" style="margin-bottom:10px">
+            恢复运营必须由<b>设备负责人</b>确认，且当前风速低于 {{ wind ? wind.limit : 15 }} m/s。
+          </div>
+          <div class="row">
+            <input v-model="resumeForms[ev.id].confirmer" placeholder="设备负责人姓名" style="width:180px" />
+            <label class="inline small">
+              <input type="checkbox" v-model="resumeForms[ev.id].isOwner" />
+              我确认身份为<b>设备负责人</b>，设备已复检安全
+            </label>
+            <input v-model="resumeForms[ev.id].remark" placeholder="复检备注（可选）" style="flex:1;min-width:180px" />
+            <button class="btn primary" @click="resumeEvent(ev)">确认恢复运营</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 本地模拟接口 ============================ -->
+    <section v-if="tab==='mock'">
+      <div class="card">
+        <h2>🌬️ 风速站模拟</h2>
+        <div class="row">
+          <input type="number" step="0.5" v-model.number="mockWind" style="width:120px" />
+          <span>m/s</span>
+          <button class="btn primary" @click="setWind">设置风速</button>
+          <span class="muted small">≥ 15 m/s 视为超限：闸机拒绝放行、停运事件不允许确认恢复。</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>💳 支付网关模拟（异步回执）</h2>
+        <div class="row" style="margin-bottom:8px">
+          <label class="inline small">自动回执延迟
+            <input type="number" step="0.5" min="0" v-model.number="payCfg.callback_delay" style="width:90px" /> 秒
+          </label>
+          <label class="inline small">
+            <input type="checkbox" v-model="payCfg.auto_callback" /> 自动投递回执
+          </label>
+          <label class="inline small">
+            <input type="checkbox" v-model="payCfg.fail_next" /> 下一笔回执强制失败
+          </label>
+          <button class="btn" @click="savePayCfg">保存配置</button>
+        </div>
+        <p class="muted small">关闭自动投递后，退款会停留在“回执处理中”，可用下方按钮模拟晚到/重复回执。</p>
+        <h3 v-if="dash && dash.pending_payments.length">待回执支付单</h3>
+        <table v-if="dash && dash.pending_payments.length">
+          <thead><tr><th>支付单号</th><th>票ID</th><th>类型</th><th>金额</th><th>手动送达回执</th></tr></thead>
+          <tbody>
+            <tr v-for="p in dash.pending_payments" :key="p.payment_no">
+              <td>{{ p.payment_no }}</td><td class="num">#{{ p.ticket_id }}</td>
+              <td>{{ p.kind==='refund'?'退款':'改签收费' }}</td>
+              <td class="num">¥{{ p.amount }}</td>
+              <td>
+                <button class="btn" @click="deliver(p.payment_no,'succeeded')">送达成功</button>
+                <button class="btn danger" @click="deliver(p.payment_no,'failed')">送达失败</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>🚧 闸机核销模拟</h2>
+        <div class="row">
+          <input v-model="gateNo" placeholder="扫描票号，如 CW-2026100301-张伟-R…" style="width:320px"
+                 @keyup.enter="gateCheck" />
+          <button class="btn primary" @click="gateCheck">核销过闸</button>
+        </div>
+        <div v-if="gateResult" class="gate-result" :class="gateResult.ok ? 'ok' : 'err'">
+            {{ gateResult.text }}
+        </div>
+        <p class="muted small">已退款票、已失效的改签旧票、候补中票、停运班次票、风速超限时均拒绝放行。</p>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-wrap">
+    <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{ t.text }}</div>
+  </div>
+</div>
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
